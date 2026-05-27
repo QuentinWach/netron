@@ -12,19 +12,21 @@ gguf.ModelFactory = class {
     }
 
     async open(context) {
-        const metadata = await context.metadata('gguf-metadata.json');
+        const metadata = await context.asset('gguf-metadata.json');
+        const entries = JSON.parse(metadata);
+        const schemas = new Map(entries.map((entry) => [entry.name, entry]));
         const target = context.value;
         await target.read();
-        return new gguf.Model(metadata, target);
+        return new gguf.Model(schemas, target);
     }
 };
 
 gguf.Model = class {
 
-    constructor(metadata, target) {
+    constructor(schemas, target) {
         this.format = target.format;
         this.metadata = [];
-        const extra = new Map();
+        const metadata = new Map();
         let architecture = '?';
         for (const [name, value] of target.metadata) {
             switch (name) {
@@ -37,7 +39,7 @@ gguf.Model = class {
                 case 'general.quantization_version':
                     break;
                 default:
-                    extra.set(name, value);
+                    metadata.set(name, value);
                     break;
             }
         }
@@ -45,7 +47,7 @@ gguf.Model = class {
         const graph = {};
         graph.type = architecture;
         graph.attributes = [];
-        for (const [name, value] of extra) {
+        for (const [name, value] of metadata) {
             if (name.startsWith('tokenizer.')) {
                 const match = name.match(/^(.*)\.(.*?)$/);
                 if (match) {
@@ -58,7 +60,8 @@ gguf.Model = class {
                 this.metadata.push(new gguf.Argument(name, value));
             }
         }
-        const context = new gguf.Context(metadata, target, extra, architecture);
+        const schema = schemas.get(architecture);
+        const context = new gguf.Context(schema, target, metadata, architecture);
         graph.layers = context.build();
         if (tokenizer.metadata.size > 0) {
             graph.layers = graph.layers || [];
@@ -80,7 +83,7 @@ gguf.Graph = class {
         this.nodes = [];
         this.inputs = [];
         this.outputs = [];
-        this.attributes = graph.attributes || [];
+        this.metadata = graph.attributes || [];
         let valueIndex = 0;
         let prevValue = null;
         let ropeFreqsValue = null;
@@ -795,13 +798,12 @@ gguf.QuantizationType = [
 
 gguf.Context = class {
 
-    constructor(metadata, target, kvMetadata, architecture) {
-        const archType = metadata ? metadata.type(architecture) : null;
-        const archDef = archType && archType.graph ? archType : null;
-        this._archDef = archDef;
+    constructor(schema, target, metadata, architecture) {
+        this._schema = schema;
         this._tensors = target.tensors;
         this._architecture = architecture;
-        this._blockCount = kvMetadata.get(`${architecture}.block_count`) || 0;
+        this._metadata = metadata;
+        this._blockCount = metadata.get(`${architecture}.block_count`) || 0;
         this._blockTypes = new Map();
         // Classifier rules are derived from this arch's `blocks` entries:
         // each entry's `name` and its `tensors` aliases are prefixes that route
@@ -809,7 +811,7 @@ gguf.Context = class {
         // prefix-with-dot-boundary so e.g. `attn_o` matches `attn_o.weight` but
         // not `attn_output.weight`.
         this._classifierRules = [];
-        if (archDef && archDef.graph) {
+        if (schema && schema.graph) {
             const registerSection = (section, classify, sectionPrefix) => {
                 if (section) {
                     for (const block of section) {
@@ -832,18 +834,18 @@ gguf.Context = class {
                     }
                 }
             };
-            registerSection(archDef.graph.input, false, '');
-            registerSection(archDef.graph.blocks, true, '');
-            registerSection(archDef.graph.output, false, '');
-            if (archDef.graph.encoder) {
-                registerSection(archDef.graph.encoder.input, false, 'enc.');
-                registerSection(archDef.graph.encoder.blocks, true, 'enc.');
-                registerSection(archDef.graph.encoder.output, false, 'enc.');
+            registerSection(schema.graph.input, false, '');
+            registerSection(schema.graph.blocks, true, '');
+            registerSection(schema.graph.output, false, '');
+            if (schema.graph.encoder) {
+                registerSection(schema.graph.encoder.input, false, 'enc.');
+                registerSection(schema.graph.encoder.blocks, true, 'enc.');
+                registerSection(schema.graph.encoder.output, false, 'enc.');
             }
-            if (archDef.graph.decoder) {
-                registerSection(archDef.graph.decoder.input, false, 'dec.');
-                registerSection(archDef.graph.decoder.blocks, true, 'dec.');
-                registerSection(archDef.graph.decoder.output, false, 'dec.');
+            if (schema.graph.decoder) {
+                registerSection(schema.graph.decoder.input, false, 'dec.');
+                registerSection(schema.graph.decoder.blocks, true, 'dec.');
+                registerSection(schema.graph.decoder.output, false, 'dec.');
             }
             // Longest-pattern-first ensures specific aliases (e.g. ffn_gate.{N},
             // attn_q_norm) win over their shorter prefixes (ffn_gate, attn_q).
@@ -852,14 +854,14 @@ gguf.Context = class {
     }
 
     get structured() {
-        return this._archDef !== null && this._tensors.size > 0;
+        return this._schema !== null && this._tensors.size > 0;
     }
 
     build() {
         const tensors = this._tensors;
         const layers = [];
         const claimed = new Set();
-        const archDef = this._archDef;
+        const schema = this._schema;
         const collectWeights = (prefix) => {
             const weights = new Map();
             for (const [name, tensor] of tensors) {
@@ -873,6 +875,9 @@ gguf.Context = class {
         };
         // Resolve display type/category for a component group from metadata
         // (when an arch definition is loaded), otherwise default to 'weights'.
+        // Per-node attributes are resolved from the entry's `attributes` list
+        // by looking up `<arch>.<key>` in the model KV (e.g. an `attention`
+        // entry listing `attention.head_count` pulls that KV onto every node).
         const resolveBlock = (group) => {
             let block = this._blockTypes.get(group);
             if (!block && (group.startsWith('enc.') || group.startsWith('dec.'))) {
@@ -881,11 +886,27 @@ gguf.Context = class {
                 // tensor key (`enc.output_norm`). Strip the prefix on lookup.
                 block = this._blockTypes.get(group.slice(4));
             }
-            return block ? { type: block.type, category: block.category } : { type: 'weights' };
+            if (!block) {
+                return { type: 'weights', metadata: new Map() };
+            }
+            // Explicit `attributes` on the entry wins; otherwise fall back to
+            // the type-default list. `attributes: []` opts a component out of
+            // per-node KV synthesis. Each entry is `{ key, name }` (display
+            // label) or a bare string (label derived from the key's last segment).
+            const entries = Array.isArray(block.attributes) ? block.attributes : (gguf.Context._typeAttributes.get(block.type) || []);
+            const metadata = new Map();
+            for (const entry of entries) {
+                const label = entry.name;
+                const key = `${this._architecture}.${entry.key}`;
+                if (this._metadata.has(key)) {
+                    metadata.set(label, this._metadata.get(key));
+                }
+            }
+            return { type: block.type, category: block.category, metadata };
         };
         const pushFlat = (prefix, weights) => {
             const resolved = resolveBlock(prefix);
-            layers.push({ name: prefix, type: resolved.type, category: resolved.category, weights, metadata: new Map(), layers: [] });
+            layers.push({ name: prefix, type: resolved.type, category: resolved.category, weights, metadata: resolved.metadata, layers: [] });
         };
         // Build a structured block at `blockPrefix`, returning sub-layers in
         // discovery order. Tensors in the block are grouped by component
@@ -923,7 +944,7 @@ gguf.Context = class {
                 }
                 if (weights.size > 0) {
                     const resolved = resolveBlock(group);
-                    blockLayers.push({ name: group, type: resolved.type, category: resolved.category, weights, metadata: new Map(), layers: [] });
+                    blockLayers.push({ name: group, type: resolved.type, category: resolved.category, weights, metadata: resolved.metadata, layers: [] });
                 }
             }
             return blockLayers;
@@ -947,7 +968,7 @@ gguf.Context = class {
         // even if some indices have no tensors (those produce empty blocks
         // and get skipped). Otherwise iterate only discovered indices.
         const expandIndices = (discovered) => {
-            if (archDef && this._blockCount > 0) {
+            if (schema && this._blockCount > 0) {
                 const out = [];
                 for (let i = 0; i < this._blockCount; i++) {
                     out.push(i);
@@ -970,10 +991,10 @@ gguf.Context = class {
                 }
             }
         };
-        if (archDef && archDef.graph) {
-            collectNames(globalPrefixes, archDef.graph.input);
-            collectNames(outputPrefixes, archDef.graph.output);
-            for (const sub of [archDef.graph.encoder, archDef.graph.decoder]) {
+        if (schema && schema.graph) {
+            collectNames(globalPrefixes, schema.graph.input);
+            collectNames(outputPrefixes, schema.graph.output);
+            for (const sub of [schema.graph.encoder, schema.graph.decoder]) {
                 if (sub) {
                     collectNames(globalPrefixes, sub.input);
                     collectNames(outputPrefixes, sub.output);
@@ -982,7 +1003,7 @@ gguf.Context = class {
         }
         outputPrefixes.add('output_norm');
         outputPrefixes.add('output');
-        if (archDef && archDef.graph) {
+        if (schema && schema.graph) {
             // An explicit `output` placement wins over the hardcoded global
             // defaults (e.g. LFM2 stores its final norm as `token_embd_norm`).
             for (const name of outputPrefixes) {
@@ -1013,7 +1034,7 @@ gguf.Context = class {
         const archName = this._architecture;
         const subgraphs = [];
         for (const [encPrefix, label] of [['enc', 'Encoder'], ['dec', 'Decoder']]) {
-            const subgraph = archDef && archDef.graph ? archDef.graph[encPrefix === 'enc' ? 'encoder' : 'decoder'] : null;
+            const subgraph = schema && schema.graph ? schema.graph[encPrefix === 'enc' ? 'encoder' : 'decoder'] : null;
             const indices = expandIndices(encDecIndices.get(encPrefix));
             if (subgraph || indices.length > 0) {
                 subgraphs.push({ prefix: encPrefix, label, indices });
@@ -1060,6 +1081,55 @@ gguf.Context = class {
         return 'other';
     }
 };
+
+// Per-node attribute defaults keyed by node type. A component's `attributes`
+// field in `gguf-metadata.json` overrides this; absence falls through to
+// these defaults. Only KV keys actually present in the file resolve to values.
+gguf.Context._typeAttributes = new Map([
+    ['RMS_NORM',                [{ key: 'attention.layer_norm_rms_epsilon', name: 'epsilon' }]],
+    ['LAYER_NORM',              [{ key: 'attention.layer_norm_epsilon',     name: 'epsilon' }]],
+    ['MULTI_HEAD_ATTENTION',    [
+        { key: 'attention.head_count',     name: 'head_count' },
+        { key: 'attention.head_count_kv',  name: 'head_count_kv' },
+        { key: 'attention.key_length',     name: 'key_length' },
+        { key: 'attention.value_length',   name: 'value_length' },
+        { key: 'attention.sliding_window', name: 'sliding_window' }
+    ]],
+    ['MULTI_LATENT_ATTENTION',  [
+        { key: 'attention.head_count',       name: 'head_count' },
+        { key: 'attention.head_count_kv',    name: 'head_count_kv' },
+        { key: 'attention.q_lora_rank',      name: 'q_lora_rank' },
+        { key: 'attention.kv_lora_rank',     name: 'kv_lora_rank' },
+        { key: 'attention.key_length_mla',   name: 'key_length_mla' },
+        { key: 'attention.value_length_mla', name: 'value_length_mla' }
+    ]],
+    ['CROSS_ATTENTION',         [
+        { key: 'attention.head_count',    name: 'head_count' },
+        { key: 'attention.head_count_kv', name: 'head_count_kv' },
+        { key: 'attention.key_length',    name: 'key_length' },
+        { key: 'attention.value_length',  name: 'value_length' }
+    ]],
+    ['ROPE_FREQS',              [
+        { key: 'rope.dimension_count',                name: 'dimension_count' },
+        { key: 'rope.freq_base',                      name: 'freq_base' },
+        { key: 'rope.scaling.type',                   name: 'scaling_type' },
+        { key: 'rope.scaling.factor',                 name: 'scaling_factor' },
+        { key: 'rope.scaling.original_context_length', name: 'original_context_length' }
+    ]],
+    ['MAMBA',                   [
+        { key: 'ssm.state_size',     name: 'state_size' },
+        { key: 'ssm.conv_kernel',    name: 'conv_kernel' },
+        { key: 'ssm.inner_size',     name: 'inner_size' },
+        { key: 'ssm.time_step_rank', name: 'time_step_rank' }
+    ]],
+    ['MAMBA2',                  [
+        { key: 'ssm.state_size',  name: 'state_size' },
+        { key: 'ssm.conv_kernel', name: 'conv_kernel' },
+        { key: 'ssm.inner_size',  name: 'inner_size' },
+        { key: 'ssm.group_count', name: 'group_count' }
+    ]],
+    ['CONV_1D',                 [{ key: 'shortconv.l_cache', name: 'l_cache' }]]
+]);
 
 gguf.Error = class extends Error {
 
